@@ -107,6 +107,40 @@ function openWindow(spaceId, cx) {
       "-Command",
       `$ErrorActionPreference = 'Stop'; $sourceHome = ${sourceHome}; $newHome = Join-Path $env:LOCALAPPDATA ${powershellQuote(`Herdr\\windows\\${id}`)}; New-Item -ItemType Directory -Force -Path (Join-Path $newHome 'layouts'), (Join-Path $newHome 'mods') | Out-Null; Copy-Item -LiteralPath (Join-Path $sourceHome 'layouts\\main-window.json') -Destination (Join-Path $newHome 'layouts') -Force; foreach ($mod in @('focus-window', 'focus-menu', 'focus-agents')) { Copy-Item -LiteralPath (Join-Path $sourceHome (Join-Path 'mods' $mod)) -Destination (Join-Path $newHome 'mods') -Recurse -Force }; foreach ($file in @('settings.json', 'keys.json', 'programs.json', 'shared.json')) { $path = Join-Path $sourceHome $file; if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $newHome -Force } }; $sharedPath = Join-Path $newHome 'shared.json'; $shared = if (Test-Path -LiteralPath $sharedPath) { Get-Content -LiteralPath $sharedPath -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }; $shared | Add-Member -MemberType NoteProperty -Name 'space.pin' -Value ${target} -Force; [System.IO.File]::WriteAllText($sharedPath, ($shared | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false)); $env:HERDR_APP_HOME = $newHome; $app = Start-Process -FilePath 'herdr-app' -PassThru; for ($i = 0; $i -lt 100; $i++) { if ($app.HasExited) { throw 'Herdr exited before its new window was ready' }; & herdr-app status 2>$null; if ($LASTEXITCODE -eq 0) { & herdr-app do layout.switch --name main-window; if ($LASTEXITCODE -ne 0) { throw 'Could not activate the copied layout' }; for ($attempt = 0; $attempt -lt 100; $attempt++) { if ($app.HasExited) { throw 'Herdr exited before the selected space was ready' }; $listingText = & herdr-app ls 2>$null; if ($LASTEXITCODE -eq 0) { $listing = $listingText | ConvertFrom-Json; $selectedSpace = $listing.spaces | Where-Object { $_.id -eq ${target} }; $activeTab = $selectedSpace.tabs | Where-Object { $_.active }; if ($activeTab) { & herdr-app do space.select --id ${target}; if ($LASTEXITCODE -ne 0) { throw 'Could not select the space in the new window' }; $terminalPane = $activeTab.terminals | Select-Object -First 1 -ExpandProperty pane; if ($terminalPane) { & herdr-app do pane.focus --pane $terminalPane; if ($LASTEXITCODE -ne 0) { throw 'Could not focus the selected space pane' } }; $status = & herdr-app status | ConvertFrom-Json; if ($status.space -eq ${target} -and (-not $terminalPane -or $status.focused_pane -eq $terminalPane)) { exit 0 } } }; Start-Sleep -Milliseconds 250 }; throw 'Timed out waiting for the new window to select and focus the space' }; Start-Sleep -Milliseconds 250 }; throw 'Timed out waiting for the new Herdr window'`,
     ];
+  } else if (window().platform === "macos") {
+    const newAppHome = `${home()}/.local/share/herdr-app/windows/${id}`;
+    const sourceHome = shellQuote(appHome());
+    command = "sh";
+    args = [
+      "-c",
+      `source_home=${sourceHome}; new_home=${shellQuote(newAppHome)}; mkdir -p "$new_home/layouts" "$new_home/mods" && cp "$source_home/layouts/main-window.json" "$new_home/layouts/" && cp -R "$source_home/mods/focus-window" "$source_home/mods/focus-menu" "$source_home/mods/focus-agents" "$new_home/mods/" || exit 1
+for file in settings.json keys.json programs.json shared.json; do [ ! -f "$source_home/$file" ] || cp "$source_home/$file" "$new_home/" || exit 1; done
+python3 -c 'import json,sys; p,space=sys.argv[1:]; f=open(p,encoding="utf-8"); data=json.load(f); f.close(); data["space.pin"]=space; f=open(p,"w",encoding="utf-8"); json.dump(data,f,ensure_ascii=False); f.close()' "$new_home/shared.json" ${shellQuote(spaceId)} || exit 1
+export HERDR_APP_HOME="$new_home"
+open -n -a Herdr --env HERDR_APP_HOME="$new_home" || exit 1
+for i in $(seq 1 100); do
+  if herdr-app status >/dev/null 2>&1; then
+    herdr-app do layout.switch --name main-window || exit 1
+    for attempt in $(seq 1 100); do
+      listing=$(herdr-app ls 2>/dev/null) || { sleep 0.25; continue; }
+      ready=$(printf '%s' "$listing" | python3 -c 'import json,sys; spaces=json.load(sys.stdin)["spaces"]; space=next((s for s in spaces if s["id"]==sys.argv[1]),None); print("1" if space and any(t.get("active") for t in space.get("tabs",[])) else "0")' ${shellQuote(spaceId)}) || exit 1
+      if [ "$ready" = 1 ]; then
+        pane=$(printf '%s' "$listing" | python3 -c 'import json,sys; spaces=json.load(sys.stdin)["spaces"]; space=next(s for s in spaces if s["id"]==sys.argv[1]); tab=next(t for t in space["tabs"] if t.get("active")); print(next(iter(tab.get("terminals",[])),{}).get("pane",""))' ${shellQuote(spaceId)}) || exit 1
+        herdr-app do space.select --id ${shellQuote(spaceId)} || exit 1
+        [ -z "$pane" ] || herdr-app do pane.focus --pane "$pane" || exit 1
+        status=$(herdr-app status) || exit 1
+        printf '%s' "$status" | python3 -c 'import json,sys; d=json.load(sys.stdin); expected=sys.argv[1:]; sys.exit(0 if d.get("space")==expected[0] and (not expected[1] or d.get("focused_pane")==expected[1]) else 1)' ${shellQuote(spaceId)} "$pane" && exit 0
+      fi
+      sleep 0.25
+    done
+    echo "Timed out waiting for the new window to select and focus the space" >&2
+    exit 1
+  fi
+  sleep 0.25
+done
+echo "Timed out waiting for the new Herdr window" >&2
+exit 1`,
+    ];
   } else {
     const newAppHome = `${home()}/.local/share/herdr-app/windows/${id}`;
     const sourceHome = shellQuote(appHome());
